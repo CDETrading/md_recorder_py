@@ -23,6 +23,8 @@ class TimeSeriesData:
     data_recv_ts_ns: int
     channel: str
     data: dict
+    
+# RawMessage = tuple[int, str]
 
 class BaseRecorder:
     WS_URL = None  # to be defined in subclass
@@ -33,8 +35,8 @@ class BaseRecorder:
     def __init__(self, api_key=None, api_secret=None):
         self.api_key = api_key
         self.api_secret = api_secret
-
-        self.data = defaultdict(Queue)
+        self.message_queue = Queue(maxsize=500000)
+        self.timeseries_data_queue = defaultdict(Queue)
         self.channel_tasks = {}
         self.active_channels = set()
         self.data_lock = asyncio.Lock()
@@ -47,54 +49,49 @@ class BaseRecorder:
                     await self.on_open(websocket)
                     await self.subscribe(websocket, subscribe_message)
                     async for message in websocket:
-                        self.on_message(message)
+                        self.message_queue.put((time.time_ns(), message))
             except Exception as e:
                 logging.error(f"[{task_id}] Error in ws_subscribe_channel ({subscribe_message}): {e}")
                 await asyncio.sleep(5)
 
-    def on_message(self, message):
-        try:
-            parsed:TimeSeriesData = self.parse_message(message)
-            if not parsed:
-                return
-            full_data = parsed.data
-            channel = parsed.channel
-            data_recv_ts_ns = parsed.data_recv_ts_ns
-   
-            self.data[channel].put([data_recv_ts_ns, full_data])
-        except Exception as e:
-            logging.error(f"on_message error: {e}")
+    
 
     def flush_data_loop(self):
         while True:
             time.sleep(5)
-            for channel in list(self.data.keys()):
-                queue = self.data[channel]
-                if queue.empty():
+            self.drain_message_queue()
+            for channel in list(self.timeseries_data_queue.keys()):
+                per_channel_queue = self.timeseries_data_queue[channel]
+                if per_channel_queue.empty():
                     continue
                 try:
-                    datas = []
+                    json_datas = []
+                    timestamps = []
                     while True:
                         try:
-                            datas.append(queue.get_nowait())
+                            timeseries_data = per_channel_queue.get_nowait()
+                            json_datas.append(timeseries_data.data)
+                            timestamps.append(timeseries_data.data_recv_ts_ns)
                         except Empty:
                             break
-                    if not datas:
+                    if len(json_datas) == 0:
                         continue
-                    df = pd.DataFrame(datas, columns=["timestamp", "data"])
+                    df = pd.json_normalize(json_datas)
+                    df['recv_ts_ns'] = timestamps
                     date = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d")
                     filename = f"./data/{self.EXCHANGE_NAME}/{date}/{channel}_{date}.parquet"
                     os.makedirs(os.path.dirname(filename), exist_ok=True)
                     if os.path.exists(filename):
-                        fastparquet.write(filename, df, append=True, file_scheme='simple')
+                        fastparquet.write(filename, df, append=True, file_scheme='simple', compression='SNAPPY')
                     else:
-                        fastparquet.write(filename, df, file_scheme='simple')
-                    logging.info(f"Flushed {len(datas)} from {channel} to {filename}")
+                        fastparquet.write(filename, df, file_scheme='simple', compression='SNAPPY')
+                    # logging.info(f"Flushed {len(json_datas)} from {channel} to {filename}")
                 except Exception as e:
                     logging.error(f"Flush error on {channel}: {e}")
 
     def start_background_flush_thread(self):
         threading.Thread(target=self.flush_data_loop, daemon=True).start()
+    
 
     async def start_listening(self):
         all_instruments = await self.fetch_instruments()
@@ -118,11 +115,14 @@ class BaseRecorder:
 
     def generate_subscribe_messages(self, instruments:list[str]) -> list[str]:
         raise NotImplementedError
+    
+    def drain_message_queue(self):
+        raise NotImplementedError
 
     async def fetch_instruments(self) -> list[str]:
         raise NotImplementedError
 
-    def parse_message(self, raw_message) -> TimeSeriesData:
+    def handle_message(self, recv_ts_ns:int, message:str) -> TimeSeriesData:
         raise NotImplementedError
 
     async def subscribe(self, websocket, subscribe_message:str):
@@ -133,3 +133,4 @@ class BaseRecorder:
 
     def connect_ws(self):
         raise NotImplementedError
+    

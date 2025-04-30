@@ -3,6 +3,8 @@ import aiohttp
 from .base_recorder import BaseRecorder, TimeSeriesData
 import json
 import time
+import logging
+from queue import Queue, Empty
 
 class GateIORecorder(BaseRecorder):
     WS_URL = "wss://api.gateio.ws/ws/v4/"
@@ -53,9 +55,21 @@ class GateIORecorder(BaseRecorder):
             }))
         return subscribe_messages
     
-    def parse_message(self, string_message) -> TimeSeriesData:
+    def drain_message_queue(self):
+        while True:
+            try:
+                recv_ts_ns, message = self.message_queue.get_nowait()
+            except Empty:
+                break
+            timeseries_data: TimeSeriesData = self.handle_message(recv_ts_ns, message)
+            if timeseries_data:
+                self.timeseries_data_queue[timeseries_data.channel].put(timeseries_data)
+            else:
+                logging.error(f"Failed to handle message: {message}")
+            
+            
+    def handle_message(self, recv_ts_ns:int, string_message:str) -> TimeSeriesData:
         try:
-            recv_ts_ns = time.time_ns()
             msg = json.loads(string_message)
             if not isinstance(msg, dict):
                 print(f"Invalid message: {string_message}")
@@ -79,9 +93,9 @@ class GateIORecorder(BaseRecorder):
             print(f"Failed to parse message: {e}")
             return None
     
-    def on_bookticker_message(self, parsed_message, recv_ts_ns):
-        channel = parsed_message.get("channel")
-        payload = parsed_message.get("result")
+    def on_bookticker_message(self, json_message, recv_ts_ns):
+        channel = json_message.get("channel")
+        payload = json_message.get("result")
         symbol = payload.get("s")
         if not symbol:
             return None
@@ -91,12 +105,12 @@ class GateIORecorder(BaseRecorder):
         return TimeSeriesData(
             data_recv_ts_ns=recv_ts_ns,
             channel=full_channel,
-            data=parsed_message
+            data=json_message
         )
 
-    def on_trades_message(self, parsed_message, recv_ts_ns):
-        channel = parsed_message.get("channel")
-        payload = parsed_message.get("result")
+    def on_trades_message(self, json_message, recv_ts_ns):
+        channel = json_message.get("channel")
+        payload = json_message.get("result")
         symbol = payload.get("currency_pair")
         if not symbol:
             return None
@@ -106,5 +120,5 @@ class GateIORecorder(BaseRecorder):
         return TimeSeriesData(
             data_recv_ts_ns=recv_ts_ns,
             channel=full_channel,
-            data=parsed_message
+            data=json_message
         )
